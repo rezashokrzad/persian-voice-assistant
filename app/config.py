@@ -2,7 +2,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
@@ -19,6 +19,14 @@ class Settings(BaseSettings):
 
     resend_api_key: str = ""
     email_from: str = ""
+    email_font_url: str = ""  # optional publicly hosted Vazir font; no local files
+
+    @field_validator("email_font_url")
+    @classmethod
+    def _public_email_font(cls, value: str) -> str:
+        from app.tools.email_renderer import public_font_url
+
+        return public_font_url(value) if value else ""
 
     postgres_user: str = "assistant"
     postgres_password: str = ""

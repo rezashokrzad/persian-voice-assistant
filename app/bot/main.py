@@ -80,7 +80,12 @@ async def respond(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
     elif reply.kind == "failed":
         await msg.reply_text(messages.AGENT_FAILED)
     else:
-        await msg.reply_text(format_preview(reply.action), reply_markup=confirmation_keyboard(reply.run_id))
+        from app.util.telegram_text import message_parts
+
+        parts = message_parts(format_preview(reply.action))
+        for part in parts[:-1]:
+            await msg.reply_text(part)
+        await msg.reply_text(parts[-1], reply_markup=confirmation_keyboard(reply.run_id))
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

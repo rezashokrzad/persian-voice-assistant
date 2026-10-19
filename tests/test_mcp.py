@@ -89,6 +89,9 @@ def test_confirmed_email_is_sent_and_audited_without_the_body(svc, fakes, sessio
     r = svc.send_email("ali@example.com", "موضوع", "متن خصوصی ایمیل", confirm=True)
     assert r == {"status": "done", "provider_message_id": "msg_9"}
     assert sent[0][:3] == ("ali@example.com", "موضوع", "متن خصوصی ایمیل")
+    from app.tools.email_renderer import render_email
+
+    assert sent[0][3]["html"] == render_email("موضوع", "متن خصوصی ایمیل")
     payload = events(session)[-1][2]
     assert payload["body_chars"] == len("متن خصوصی ایمیل") and "متن خصوصی" not in json.dumps(payload, ensure_ascii=False)
 

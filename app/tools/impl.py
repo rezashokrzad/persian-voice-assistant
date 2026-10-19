@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.db.models import Contact, MemoryFact
 from app.tools.google_calendar import GoogleCalendar
+from app.tools.email_renderer import render_email
 from app.tools.registry import Tool, ToolContext, register
 from app.tools.resend_client import send_email as resend_send
 from app.util.persian import (
@@ -203,8 +204,13 @@ def create_calendar_event(ctx: ToolContext, args: CreateEventArgs) -> dict:
 
 
 def send_email(ctx: ToolContext, args: SendEmailArgs) -> dict:
+    from app.config import get_settings
+
     key = f"run-{ctx.run_id}-send_email" if ctx.run_id else None
-    message_id = resend_send(str(args.to), args.subject, args.body, idempotency_key=key)
+    message_id = resend_send(
+        str(args.to), args.subject, args.body,
+        html=render_email(args.subject, args.body, font_url=get_settings().email_font_url), idempotency_key=key,
+    )
     return {"provider_message_id": message_id}
 
 

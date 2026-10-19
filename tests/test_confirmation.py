@@ -110,6 +110,9 @@ def test_confirm_sends_the_email_once_with_a_provider_idempotency_key(session, u
     (to, subject, body, kw) = spy.email_calls[0]
     assert len(spy.email_calls) == 1 and to == "owner@example.com"
     assert kw["idempotency_key"] == f"run-{run.id}-send_email"
+    from app.tools.email_renderer import render_email
+
+    assert kw["html"] == render_email(subject, body)
     row = session.scalars(select(Email)).one()
     assert row.provider_message_id == "msg_123" and row.status == "sent" and row.to_address == to
 
@@ -191,6 +194,28 @@ def test_schedule_preview_is_persian_and_shows_both_calendars():
 def test_email_preview_shows_recipient_subject_body():
     text = format_preview(EmailAction(to="ali@example.com", to_name="علی", subject="سلام", body="متن"))
     assert "ali@example.com" in text and "موضوع: سلام" in text and "متن" in text
+
+
+def test_email_execution_retry_reuses_approved_content_and_provider_key(session, user, monkeypatch):
+    from app.tools.email_renderer import render_email
+
+    calls = []
+
+    def send(to, subject, body, **kw):
+        calls.append((to, subject, body, kw))
+        if len(calls) == 1:
+            raise RuntimeError("temporary provider failure")
+        return "msg_retry"
+
+    monkeypatch.setattr(impl, "resend_send", send)
+    run = make_run(session, user, EMAIL)
+    assert calls == []
+    assert not confirm_run(session, user, run.id).ok
+    assert confirm_run(session, user, run.id, retry=True).ok
+    assert not confirm_run(session, user, run.id, retry=True).ok
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert calls[1][3]["html"] == render_email(calls[1][1], calls[1][2])
+    assert len(session.scalars(select(Email).where(Email.run_id == run.id)).all()) == 1
 
 
 def test_keyboard_has_confirm_edit_cancel():

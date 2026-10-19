@@ -6,6 +6,7 @@ import httpx
 
 from app.config import get_settings
 from app.tools.http_retry import retry_connect
+from app.util.telegram_text import message_parts
 
 log = logging.getLogger("notify")
 
@@ -14,16 +15,18 @@ def telegram_send(chat_id: int, text: str, reply_markup: dict | None = None) -> 
     s = get_settings()
     if not s.telegram_bot_token:
         return False
-    payload: dict = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
     base = (s.telegram_api_base_url or "https://api.telegram.org").rstrip("/")
     try:
         url = f"{base}/bot{s.telegram_bot_token}/sendMessage"
-        resp = retry_connect(
-            lambda: httpx.post(url, json=payload, timeout=15, proxy=s.telegram_proxy_url or None)
-        )
-        resp.raise_for_status()
+        parts = message_parts(text)
+        for index, part in enumerate(parts):
+            payload: dict = {"chat_id": chat_id, "text": part}
+            if reply_markup and index == len(parts) - 1:
+                payload["reply_markup"] = reply_markup
+            resp = retry_connect(
+                lambda: httpx.post(url, json=payload, timeout=15, proxy=s.telegram_proxy_url or None)
+            )
+            resp.raise_for_status()
         return True
     except httpx.HTTPError as exc:
         # Never log the exception text: for HTTP errors it embeds the URL, which contains the token.
