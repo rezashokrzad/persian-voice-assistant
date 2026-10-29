@@ -128,7 +128,7 @@ def test_upcoming_events(svc):
 # ---- through the real MCP server object (tool schemas, resource, protocol-level errors)
 
 
-def test_server_exposes_the_four_tools_and_the_resource(svc):
+def test_server_exposes_the_tools_and_the_resource(svc):
     server = build_server(svc)
 
     async def go():
@@ -137,8 +137,28 @@ def test_server_exposes_the_four_tools_and_the_resource(svc):
         return tools, resources
 
     tools, resources = asyncio.run(go())
-    assert set(tools) == {"find_contact", "list_calendar_events", "create_calendar_event", "send_email"}
+    assert {"find_contact", "list_calendar_events", "create_calendar_event", "send_email"} <= set(tools)
+    assert {
+        "search_movie",
+        "search_tv",
+        "get_title_details",
+        "discover_movies",
+        "discover_tv",
+        "get_trending",
+        "get_recommendations",
+        "set_preference",
+        "remove_preference",
+        "list_preferences",
+        "watchlist_add",
+        "watchlist_remove",
+        "watchlist_list",
+        "import_title_list",
+        "resolve_pending",
+        "make_google_search_link",
+        "get_recent_list",
+    } <= set(tools)
     assert "confirm" in tools["send_email"].inputSchema["properties"]
+    assert "confirm" in tools["set_preference"].inputSchema["properties"]
     assert tools["send_email"].inputSchema["properties"]["confirm"]["default"] is False
     assert resources == ["calendar://upcoming"]
 

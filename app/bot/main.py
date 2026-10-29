@@ -3,8 +3,9 @@ import logging
 from pathlib import Path
 
 from sqlalchemy import select
-from telegram import InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -17,17 +18,23 @@ from telegram.ext import (
 )
 
 from app.agent.executor import cancel_run, confirm_run
+from app.agent.schemas import MediaReply
 from app.bot import messages
+from app.bot.media_format import media_caption, media_keyboard, pending_keyboard, pending_text
 from app.bot.pipeline import Reply, analyse, get_or_create_user
 from app.bot.preview import confirmation_keyboard, feedback_keyboard, format_preview
 from app.bot.cleanup import cleanup_loop
 from app.bot.heartbeat import heartbeat_loop
 from app.bot.ratelimit import RateLimiter
 from app.config import get_settings
-from app.db.models import AgentRun, AuditEvent, RunFeedback, VoiceMessage
+from app.db.models import AgentRun, AuditEvent, MediaItem, RecommendationContext, RunFeedback, VoiceMessage
 from app.db.session import SessionLocal
 from app.logging_config import setup_logging
+from app.media import container
+from app.media.catalog import item_out
+from app.media.schemas import MediaItemOut
 from app.stt.vosk_stt import SttError, transcribe_ogg
+from app.util.persian import to_fa_digits
 
 log = logging.getLogger("bot")
 _limiter: RateLimiter | None = None
@@ -62,16 +69,74 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(messages.HELP)
 
 
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, markup = await asyncio.to_thread(_watchlist_view, update.effective_user)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
 # ---------- agent replies ----------
 
 
+def _load_media(action: MediaReply, tg_user, chat_id: int):
+    with SessionLocal() as session:
+        user = get_or_create_user(session, tg_user)
+        cards: list[tuple[MediaItemOut, str | None]] = []
+        for card in action.items:
+            item = session.get(MediaItem, card.media_id)
+            if item is not None:
+                cards.append((item_out(item), card.reason))
+        pending = None
+        if action.pending_id is not None:
+            row = session.get(RecommendationContext, action.pending_id)
+            if (
+                row is not None
+                and row.user_id == user.id
+                and row.chat_id == chat_id
+                and row.kind == "pending_import"
+                and row.status == "pending"
+            ):
+                candidates = [MediaItemOut.model_validate(c) for c in row.candidates or []]
+                pending = (row.query_text or "این عنوان", row.id, candidates)
+        return cards, pending
+
+
+async def send_media(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: MediaReply, run_id: int | None
+) -> None:
+    """Short Persian text + each card as a photo when possible, else text. Never audio."""
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    cards, pending = await asyncio.to_thread(_load_media, action, update.effective_user, chat_id)
+    await msg.reply_text(
+        action.text, reply_markup=feedback_keyboard(run_id) if run_id is not None else None
+    )
+    for item, reason in cards:
+        caption = media_caption(item, reason)
+        keyboard = media_keyboard(item)
+        if item.poster_url:
+            try:
+                await msg.reply_photo(photo=item.poster_url, caption=caption, reply_markup=keyboard)
+                continue
+            except TelegramError:
+                log.warning("Poster send failed for media %s; falling back to text", item.id)
+        await msg.reply_text(caption, reply_markup=keyboard)
+    if pending is not None:
+        title, pending_id, candidates = pending
+        await msg.reply_text(pending_text(title, candidates), reply_markup=pending_keyboard(pending_id, candidates))
+
+
 async def respond(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, voice_id: int | None = None):
-    """Run the agent on `text` and send either a question or a confirmable preview."""
+    """Run the agent on `text` and send a question, a media answer or a confirmable preview."""
     msg = update.effective_message
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     editing = context.user_data.pop("editing_run", None)
     reply: Reply = await asyncio.to_thread(
-        analyse, update.effective_user, text, voice_message_id=voice_id, editing_run_id=editing
+        analyse,
+        update.effective_user,
+        text,
+        chat_id=msg.chat_id,
+        voice_message_id=voice_id,
+        editing_run_id=editing,
     )
     if reply.kind == "clarify":
         await msg.reply_text(reply.text, reply_markup=feedback_keyboard(reply.run_id))
@@ -79,6 +144,8 @@ async def respond(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
         await msg.reply_text(messages.BUDGET_STOP)
     elif reply.kind == "failed":
         await msg.reply_text(messages.AGENT_FAILED)
+    elif reply.kind == "media":
+        await send_media(update, context, reply.action, reply.run_id)
     else:
         from app.util.telegram_text import message_parts
 
@@ -92,12 +159,152 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await respond(update, context, update.message.text)
 
 
+def _media_work(tg_user, chat_id: int, data: str):
+    """Validate ownership and apply one like/dislike/watched/watchlist/resolve choice."""
+    parts = data.split(":")
+    with SessionLocal() as session:
+        user = get_or_create_user(session, tg_user)
+        if parts[1] == "rp":
+            pending_id, choice = int(parts[2]), int(parts[3])
+            try:
+                result = container.imports_for(session).resolve_pending(
+                    user.id, chat_id, pending_id, choice
+                )
+            except ValueError as exc:
+                return "error", str(exc), None
+            item = result["item"]
+            return "resolved", f"«{item['title_fa']}» ثبت شد ✅", None
+
+        media_id = int(parts[2])
+        preferences = container.preferences_for(session)
+        if not preferences.is_visible_to_user(user.id, chat_id, media_id):
+            return "forbidden", messages.MEDIA_NOT_ALLOWED, None
+        media = session.get(MediaItem, media_id)
+        if media is None:
+            return "missing", messages.MEDIA_UNAVAILABLE, None
+        action = {"lk": "liked", "dl": "disliked", "wt": "watched", "wl": "watchlist"}[parts[1]]
+        result = preferences.set(user.id, media_id, action)
+        label = {
+            "liked": "پسندیدم",
+            "disliked": "نپسندیدم",
+            "watched": "دیدم",
+            "watchlist": "واچ‌لیست",
+        }[action]
+        state = "saved" if result.get("created") else "already"
+        return state, f"«{media.title_fa}» در {label} ثبت شد ✅", media_id
+
+
+def _confirm_row() -> list[InlineKeyboardButton]:
+    """دکمهٔ غیرفعال برای نمایش تأیید رأی به‌جای دکمه‌های حذف‌شده."""
+    return [InlineKeyboardButton(messages.FEEDBACK_THANKS, callback_data="noop")]
+
+
+def _drop_buttons(
+    markup: InlineKeyboardMarkup | None,
+    drop: set[str],
+    *,
+    whole_row: bool = False,
+    add_confirmation: bool = False,
+) -> InlineKeyboardMarkup | None:
+    """حذف دکمه‌های مشخص‌شده و در صورت نیاز افزودن ردیف تأیید."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if markup is not None:
+        for row in markup.inline_keyboard:
+            if whole_row and any(b.callback_data in drop for b in row):
+                continue
+            kept = [b for b in row if b.callback_data not in drop]
+            if kept:
+                rows.append(kept)
+    if add_confirmation:
+        rows.append(_confirm_row())
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _media_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    state, text, media_id = await asyncio.to_thread(
+        _media_work, update.effective_user, query.message.chat_id, data
+    )
+    if state in ("forbidden", "missing", "error"):
+        await query.answer(text, show_alert=True)
+        return
+    await query.answer(text)
+
+    if data.startswith("md:rp:"):
+        drop, whole_row, confirm = {data}, True, False
+    elif data.startswith(("md:lk:", "md:dl:")):
+        # پسندیدم و نپسندیدم هر دو با هم حذف می‌شوند و فقط تأیید کوتاه می‌ماند
+        drop = {f"md:lk:{media_id}", f"md:dl:{media_id}"}
+        whole_row, confirm = False, True
+    else:
+        drop, whole_row, confirm = {data}, False, False
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=_drop_buttons(
+                query.message.reply_markup, drop, whole_row=whole_row, add_confirmation=confirm
+            )
+        )
+    except TelegramError:
+        log.debug("Could not update media keyboard", exc_info=True)
+
+
+def _watchlist_view(tg_user) -> tuple[str, InlineKeyboardMarkup | None]:
+    """متن و دکمه‌های واچ‌لیست را از پایگاه داده می‌سازد (همیشه به‌روز)."""
+    with SessionLocal() as session:
+        user = get_or_create_user(session, tg_user)
+        items = container.preferences_for(session).watchlist(user.id)
+    if not items:
+        return messages.WATCHLIST_EMPTY, None
+    lines = [messages.WATCHLIST_TITLE, ""]
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, item in enumerate(items, start=1):
+        kind = "سریال" if item.media_type.value == "tv" else "فیلم"
+        year = f" ({to_fa_digits(item.year)})" if item.year else ""
+        lines.append(f"{to_fa_digits(index)}. {item.title_fa}{year} — {kind}")
+        rows.append(
+            [InlineKeyboardButton(f"🗑 حذف «{item.title_fa}» از واچ‌لیست", callback_data=f"wl:rm:{item.id}")]
+        )
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    media_id = int(query.data.split(":")[2])
+
+    def remove() -> dict:
+        with SessionLocal() as session:
+            user = get_or_create_user(session, update.effective_user)
+            return container.preferences_for(session).watchlist_remove(user.id, media_id)
+
+    result = await asyncio.to_thread(remove)
+    if not result.get("removed"):
+        await query.answer(messages.ERROR, show_alert=True)
+        return
+
+    text, markup = await asyncio.to_thread(_watchlist_view, update.effective_user)
+    await query.answer(messages.WATCHLIST_REMOVED)
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except TelegramError:
+        log.debug("Could not update the watchlist message", exc_info=True)
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    if query.data.startswith("md:"):
+        await _media_button(update, context)
+        return
+    if query.data.startswith("wl:"):
+        await _watchlist_button(update, context)
+        return
+    if query.data == "noop":  # دکمهٔ تأیید رأی هیچ کاری انجام نمی‌دهد
+        await query.answer()
+        return
     if query.data.startswith("fb:"):
         await _feedback(update, context)
         return
+    await query.answer()
     action, _, raw_id = query.data.partition(":")
     run_id = int(raw_id)
     await query.edit_message_reply_markup(reply_markup=None)  # buttons vanish on the first tap
@@ -252,7 +459,13 @@ def build_application() -> Application:
     app.add_handler(TypeHandler(Update, guard), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^((ok|no|ed):\d+|fb:\d+:-?1)$"))
+    app.add_handler(CommandHandler("watchlist", watchlist_command))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_button,
+            pattern=r"^((ok|no|ed):\d+|fb:\d+:-?1|md:(lk|dl|wt|wl):\d+|md:rp:\d+:\d+|wl:rm:\d+|noop)$",
+        )
+    )
     app.add_handler(MessageHandler(filters.VOICE, voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     app.add_error_handler(on_error)

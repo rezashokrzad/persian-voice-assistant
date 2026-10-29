@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import (
     BigInteger,
     Date,
+    DateTime,
     Enum,
     Float,
     ForeignKey,
@@ -28,6 +29,7 @@ from app.db.base import Base, TimestampMixin
 class Intent(str, enum.Enum):
     schedule = "schedule"
     email = "email"
+    movie_series = "movie_series"
     unknown = "unknown"
 
 
@@ -222,3 +224,93 @@ class BudgetAlert(TimestampMixin, Base):
     period: Mapped[str] = mapped_column(String(32))  # e.g. "day:2026-10-15", "month:1405-07"
     threshold: Mapped[int] = mapped_column(Integer)  # 80 or 100
     tokens_used: Mapped[int] = mapped_column(BigInteger)
+
+
+# ---------- movies and series ----------
+
+
+class MediaType(str, enum.Enum):
+    movie = "movie"
+    tv = "tv"
+
+
+class MediaAction(str, enum.Enum):
+    liked = "liked"
+    disliked = "disliked"
+    watched = "watched"
+    watchlist = "watchlist"
+
+
+class MediaItem(TimestampMixin, Base):
+    """One movie or series, cached from TMDb (and optionally enriched by OMDb)."""
+
+    __tablename__ = "media_items"
+    __table_args__ = (
+        UniqueConstraint("tmdb_id", "media_type", name="uq_media_items_tmdb_id_media_type"),
+        Index("ix_media_items_original_title_year", "original_title", "year"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tmdb_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    media_type: Mapped[MediaType] = mapped_column(_enum(MediaType, "media_type"))
+    imdb_id: Mapped[str | None] = mapped_column(String(32))
+    title_fa: Mapped[str] = mapped_column(String(500))
+    original_title: Mapped[str] = mapped_column(String(500))
+    year: Mapped[int | None] = mapped_column(Integer)
+    overview: Mapped[str | None] = mapped_column(Text)
+    # [{"id": 28, "name": "اکشن"}, ...]: JSONB keeps the cache schema flexible (no genre join table).
+    genres: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, server_default="[]")
+    vote_average: Mapped[float | None] = mapped_column(Float)
+    vote_source: Mapped[str | None] = mapped_column(String(20))  # tmdb | omdb
+    poster_path: Mapped[str | None] = mapped_column(String(500))
+
+
+class UserMediaPreference(TimestampMixin, Base):
+    """Liked, disliked, watched and watchlist are deliberately separate facts."""
+
+    __tablename__ = "user_media_preferences"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "media_id", "action_type", name="uq_user_media_preferences_user_id_media_id_action_type"
+        ),
+        Index("ix_user_media_preferences_user_id_action_type", "user_id", "action_type"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    media_id: Mapped[int] = mapped_column(ForeignKey("media_items.id", ondelete="CASCADE"), index=True)
+    action_type: Mapped[MediaAction] = mapped_column(_enum(MediaAction, "media_action"))
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class RecommendationContext(TimestampMixin, Base):
+    """The last list shown to a user in a chat, so «دومی» can be resolved and repeats avoided.
+
+    status:
+      active       one of the current list positions
+      superseded   an older list (kept for the repeat penalty until it expires)
+      pending      an ambiguous import title waiting for the owner's choice
+      resolved     the owner chose one of the pending candidates
+      expired      TTL passed (rows are also physically cleaned up opportunistically)
+    """
+
+    __tablename__ = "recommendation_contexts"
+    __table_args__ = (
+        Index("ix_recommendation_contexts_user_id_chat_id_status", "user_id", "chat_id", "status"),
+        Index("ix_recommendation_contexts_request_hash", "request_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    media_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_items.id", ondelete="CASCADE"), index=True
+    )
+    position: Mapped[int] = mapped_column(Integer, default=0)  # 1-based for recommendation lists
+    request_hash: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="recommendation")  # recommendation | pending_import
+    candidates: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    query_text: Mapped[str | None] = mapped_column(String(500))
+    target_action: Mapped[MediaAction | None] = mapped_column(_enum(MediaAction, "media_action_target"))
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)

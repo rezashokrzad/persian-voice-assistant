@@ -17,9 +17,35 @@ def new_run(session, user):
     return run
 
 
-def test_agent_only_sees_read_only_tools():
+def test_agent_only_sees_read_only_and_media_tools():
     names = {s["function"]["name"] for s in agent_tool_schemas()}
-    assert names == {"get_current_datetime", "convert_jalali_date", "find_contact", "list_calendar_events"}
+    assert {
+        "get_current_datetime",
+        "convert_jalali_date",
+        "find_contact",
+        "list_calendar_events",
+    } <= names
+    assert {
+        "search_movie",
+        "search_tv",
+        "get_title_details",
+        "discover_movies",
+        "discover_tv",
+        "get_trending",
+        "get_recommendations",
+        "set_preference",
+        "remove_preference",
+        "list_preferences",
+        "watchlist_add",
+        "watchlist_remove",
+        "watchlist_list",
+        "import_title_list",
+        "resolve_pending",
+        "make_google_search_link",
+        "get_recent_list",
+    } <= names
+    # Outside-world writes still never reach the agent.
+    assert "send_email" not in names and "create_calendar_event" not in names
     assert REGISTRY["send_email"].side_effect and REGISTRY["create_calendar_event"].side_effect
 
 

@@ -4,7 +4,7 @@ import datetime as dt
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.agent.schemas import Action, ScheduleAction
+from app.agent.schemas import Action, MediaReply, ScheduleAction
 from app.util.persian import jalali_long_fa, to_fa_digits
 
 
@@ -30,6 +30,8 @@ def format_preview(action: Action) -> str:
             f"توضیحات: {action.description or '—'}\n\n"
             "با تأیید شما، رویداد ساخته می‌شود و برای مهمانان دعوت‌نامه ارسال می‌شود."
         )
+    if isinstance(action, MediaReply):
+        return action.text
     return (
         "✉️ پیش‌نمایش ایمیل\n\n"
         f"گیرنده: {action.to_name + ' ' if action.to_name else ''}<{action.to}>\n"

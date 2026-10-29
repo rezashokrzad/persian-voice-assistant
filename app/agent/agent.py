@@ -14,8 +14,8 @@ from app.agent.context import AgentContext, render_user_message
 from app.agent.llm import LLMError, LLMProvider
 from app.agent.llm_log import purpose_var
 from app.agent.prompt import PROMPT_VERSION, SYSTEM_PROMPT
-from app.agent.schemas import Action, Clarification, EmailAction, ScheduleAction
-from app.db.models import AgentRun, Intent, RunStatus, User
+from app.agent.schemas import Action, Clarification, EmailAction, MediaReply, ScheduleAction
+from app.db.models import AgentRun, Intent, MediaItem, RecommendationContext, RunStatus, User
 from app.logging_config import bind_run_id
 from app.tools import impl as _tool_implementations  # noqa: F401  (registers the tools)
 from app.tools.registry import (
@@ -34,13 +34,16 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 TERMINAL_TOOLS: dict[str, type[BaseModel]] = {
     "propose_schedule": ScheduleAction,
     "propose_email": EmailAction,
+    "propose_media_reply": MediaReply,
     "ask_clarification": Clarification,
 }
 _TERMINAL_DESCRIPTIONS = {
     "propose_schedule": "FINAL. Propose one calendar event for the owner to confirm.",
     "propose_email": "FINAL. Propose one email to a single recipient for the owner to confirm.",
-    "ask_clarification": "FINAL. Ask the owner one short Persian question when information is missing "
-    "or the request is out of scope.",
+    "propose_media_reply": "FINAL. Answer a movie/series request in short Persian. Include the "
+    "media tools' internal media_id values in items; never invent a title, score, genre or id.",
+    "ask_clarification": "FINAL. Ask the owner one short Persian question when information is missing, "
+    "a title match is ambiguous, or the request is out of scope.",
 }
 
 
@@ -60,7 +63,7 @@ def _terminal_schemas() -> list[dict[str, Any]]:
 
 @dataclass
 class AgentOutcome:
-    kind: Literal["schedule", "email", "clarify", "failed"]
+    kind: Literal["schedule", "email", "media", "clarify", "failed"]
     action: Action | None = None
     question: str | None = None
     error: str | None = None
@@ -94,6 +97,28 @@ def _validate_action(action: Action, ctx: ToolContext, input_text: str) -> str |
         )
     if isinstance(action, ScheduleAction) and len({str(g.email).lower() for g in action.guests}) != len(action.guests):
         return "Duplicate guests."
+    return None
+
+
+def _validate_media(action: MediaReply, ctx: ToolContext) -> str | None:
+    """Every media card must be a real cached item; a pending id must belong to this chat."""
+    seen: set[int] = set()
+    for card in action.items:
+        if card.media_id in seen:
+            return "Duplicate media cards."
+        seen.add(card.media_id)
+        if ctx.session.get(MediaItem, card.media_id) is None:
+            return f"Unknown media id {card.media_id}: only use ids returned by media tools."
+    if action.pending_id is not None:
+        pending = ctx.session.get(RecommendationContext, action.pending_id)
+        if (
+            pending is None
+            or pending.user_id != ctx.user.id
+            or pending.chat_id != ctx.chat_id
+            or pending.kind != "pending_import"
+            or pending.status != "pending"
+        ):
+            return "Unknown pending choice: only use a pending_id returned by import_title_list."
     return None
 
 
@@ -135,7 +160,8 @@ def run_agent(
             messages.append(
                 {
                     "role": "user",
-                    "content": "Finish by calling propose_schedule, propose_email or ask_clarification.",
+                    "content": "Finish by calling propose_schedule, propose_email, "
+                    "propose_media_reply or ask_clarification.",
                 }
             )
             continue
@@ -185,6 +211,14 @@ def _handle_terminal(ctx: ToolContext, name: str, raw: str, text: str):
         record_tool_call(ctx, name, parsed.model_dump(mode="json"), {"accepted": True}, "ok", None, None)
         return None, {"kind": "clarify", "question": parsed.question}
 
+    if isinstance(parsed, MediaReply):
+        problem = _validate_media(parsed, ctx)
+        if problem:
+            record_tool_call(ctx, name, parsed.model_dump(mode="json"), None, "rejected", None, problem)
+            return problem, None
+        record_tool_call(ctx, name, parsed.model_dump(mode="json"), {"accepted": True}, "ok", None, None)
+        return None, {"kind": "media", "action": parsed}
+
     problem = _validate_action(parsed, ctx, text)
     if problem:
         record_tool_call(ctx, name, parsed.model_dump(mode="json"), None, "rejected", None, problem)
@@ -204,6 +238,7 @@ def process_message(
     agent_ctx: AgentContext,
     *,
     voice_message_id: int | None = None,
+    chat_id: int = 0,
     now=tehran_now,
 ) -> tuple[AgentRun, AgentOutcome]:
     """Run the agent for one message and record the run, its tool calls, tokens and latency."""
@@ -219,7 +254,7 @@ def process_message(
     session.add(run)
     session.commit()
 
-    ctx = ToolContext(session=session, user=user, run_id=run.id, now=now)
+    ctx = ToolContext(session=session, user=user, run_id=run.id, now=now, chat_id=chat_id)
     ctx.known_emails |= {c["email"].lower() for c in agent_ctx.contacts if c.get("email")}
     started = time.perf_counter()
     try:
@@ -237,6 +272,12 @@ def process_message(
         run.intent = Intent(outcome.kind)
         run.action_json = outcome.action.model_dump(mode="json")
         run.status = RunStatus.pending_confirmation
+        run.error = None
+    elif outcome.kind == "media":
+        # A media answer is already complete: no outside-world action, nothing to confirm.
+        run.intent = Intent.movie_series
+        run.action_json = outcome.action.model_dump(mode="json")
+        run.status = RunStatus.executed
         run.error = None
     elif outcome.kind == "clarify":
         run.intent = Intent.unknown

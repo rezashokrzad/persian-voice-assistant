@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     google_refresh_token: str = ""
     google_calendar_id: str = "primary"
 
+    # --- Movies and series (TMDb primary, OMDb selective enrichment) ---
+    tmdb_api_key: str = ""
+    omdb_api_key: str = ""
+    tmdb_base_url: str = "https://api.themoviedb.org/3"
+    tmdb_image_base_url: str = "https://image.tmdb.org/t/p/w500"
+    omdb_base_url: str = "https://www.omdbapi.com"
+    # TMDb's Persian metadata; falls back to the original title when a translation is missing.
+    media_language: str = "fa-IR"
+    media_timeout_s: float = 15.0
+    media_max_retries: int = 1  # one retry on 429/5xx only; provider errors are never empty results
+    recommendation_context_ttl_minutes: int = 30
+
     log_level: str = "INFO"
     debug: bool = False  # exposes the OpenAPI docs; keep off in production
 

@@ -1,6 +1,6 @@
 # Persian Voice Assistant
 
-A personal Telegram assistant: send a voice message in Persian, review the proposed action, tap **Confirm**, and it creates a Google Calendar event or sends an email. Nothing runs without your confirmation. See [docs/SPEC.md](docs/SPEC.md).
+A personal Telegram assistant: send a voice message in Persian, review the proposed action, tap **Confirm**, and it creates a Google Calendar event or sends an email. It also suggests films and series (with a poster, a Google link and like/dislike/watched/watchlist buttons) and keeps those preferences in PostgreSQL. Nothing outside the database runs without your confirmation. See [docs/SPEC.md](docs/SPEC.md).
 
 ```
 voice (OGG/Opus) → ffmpeg → Vosk (fa) → transcript ─┐
@@ -8,10 +8,17 @@ text message ──────────────────────�
                                                     ▼
              DeepSeek agent (≤6 steps, read-only tools, validated JSON)
                                                     ▼
-        Persian preview  [✅ تأیید] [✏️ ویرایش] [❌ لغو]
+        Persian preview  [✅ تأیید] [✏️ ویرایش] [❌ لغو]      film/series card + buttons
                                                     ▼  (Confirm only)
                     Google Calendar  /  Resend email
 ```
+
+## Requirements
+
+- Docker Engine with the Compose v2 plugin (the only runtime dependency; Python, ffmpeg and the Vosk model live in the image).
+- A Telegram bot token and your numeric Telegram user id.
+- A DeepSeek API key (or another OpenAI-compatible endpoint via `DEEPSEEK_BASE_URL`).
+- Optional: a Resend key for email, Google OAuth credentials for Calendar, and a TMDb key for films/series.
 
 ## Quick start
 
@@ -19,6 +26,8 @@ text message ──────────────────────�
 cp .env.example .env        # fill in the values (see below)
 docker compose up --build
 ```
+
+`.env` and everything under `secrets/` are git-ignored; `.env.example` contains every supported variable with safe placeholders and no real secrets.
 
 | Service     | What it does                                                                         |
 |-------------|--------------------------------------------------------------------------------------|
@@ -37,10 +46,11 @@ Production (HTTPS dashboard behind Caddy, limits, log rotation, backups): see **
 ## Setup checklist
 
 1. **Telegram**: create a bot with @BotFather → `TELEGRAM_BOT_TOKEN`. Put your numeric ID (from @userinfobot) in `ALLOWED_USER_IDS`.
-2. **Resend**: `RESEND_API_KEY`, and `EMAIL_FROM` on a verified domain (or `onboarding@resend.dev` for tests). Check it: `docker compose run --rm bot python -m app.cli send-test-email`.
+2. **Resend**: `RESEND_API_KEY`, and `EMAIL_FROM` on a verified domain (or `onboarding@resend.dev` for tests). Check it: `docker compose run --rm bot python -m app.cli send-test-email`. Emails are sent as RTL HTML with a plain-text fallback.
 3. **DeepSeek**: `DEEPSEEK_API_KEY` (base URL and model are configurable).
 4. **Google Calendar**: see below.
-5. `docker compose run --rm bot python -m app.cli seed` creates the owner and two sample contacts (optional; the owner is also created on first message).
+5. **Movies and series (optional)**: get a free TMDb API key and set `TMDB_API_KEY`; `OMDB_API_KEY` is optional and only fills missing details. Without a key, media requests answer with a clear configuration message instead of pretending nothing was found.
+6. `docker compose run --rm bot python -m app.cli seed` creates the owner and two sample contacts (optional; the owner is also created on first message).
 
 ### Google Calendar (one-time OAuth)
 
@@ -57,6 +67,24 @@ Production (HTTPS dashboard behind Caddy, limits, log rotation, backups): see **
 6. `docker compose up -d --force-recreate bot` to pick up the new values.
 
 Events are created in `Asia/Tehran` time with `sendUpdates=all`, so guests receive an invitation email from Google.
+
+## Movies and series
+
+Ask in text or voice: «یک فیلم کمدی پیشنهاد بده»، «سریال‌های جدید ترسناک»، «دومی را به واچ‌لیست اضافه کن». The same pipeline handles both input types; the intent router picks `movie_series` and never treats a calendar or email request as a media one.
+
+- **Data**: TMDb is the primary source (search, discover, trending, details, Persian title when a translation exists). OMDb is called only when an item is missing an IMDb id or rating; it never overwrites a good TMDb value. Provider failures are reported as failures, not as "no results".
+- **Recommendations** are deterministic, not an ML model: explicit genre/year/rating filters win, disliked titles are always excluded, watched titles are excluded from "new" suggestions, liked genres raise the score, recently shown titles get a repeat penalty, and trending is the fallback with an explicit «پیشنهاد عمومی» note. The "why" line is built from stored genres and facts, never invented.
+- **Cards**: a poster with a Persian caption when available; otherwise the same caption as text. Each card has like / dislike / watched / watchlist buttons plus two search links: Google (Persian title) and «جستجوی بدون سانسور» (simindad, built from the base English title only). The last shown list is kept for 30 minutes (`RECOMMENDATION_CONTEXT_TTL_MINUTES`) so «دومی» is deterministic; a new list replaces it.
+- **Watchlist**: `/watchlist` sends every saved film/series with a «حذف از واچ‌لیست» button under each item; removing an item edits the same message and the empty list replies «لیست شما خالی است 📭». Votes and the watchlist are stored in PostgreSQL and scoped by user id.
+- **Links**: the Google button opens a search built from the Persian title (plus the year, and «دوبله فارسی» / «زیرنویس فارسی» only when you asked). The uncensored button uses `https://www.simindad.top/?s=` with only the base English title (`original_title`, without subtitle, part number, year or genre). The bot never claims a title is available, downloadable or legal.
+- **Preferences** live in `user_media_preferences` (liked / disliked / watched / watchlist) and are scoped by user id. Importing a list («این‌ها را دیده‌ام: …») records exact matches and asks you to choose when a title is ambiguous; it never guesses.
+
+Required settings: `TMDB_API_KEY` (and optionally `OMDB_API_KEY`). All provider calls use the shared client in `app/http_client.py` with TLS certificate verification enabled.
+
+```bash
+docker compose run --rm migrate              # alembic upgrade head (media tables + intent constraint)
+docker compose up -d --force-recreate bot
+```
 
 ## How the agent stays safe
 
@@ -88,7 +116,7 @@ Responses never include audio paths, Telegram file ids or configured secrets (er
 
 ## MCP server
 
-The same tools the agent uses, as an [MCP](https://modelcontextprotocol.io) server: `find_contact`, `list_calendar_events`, `create_calendar_event`, `send_email`, plus the resource `calendar://upcoming` (next 7 days). `create_calendar_event` and `send_email` do nothing unless `confirm=true` (otherwise they return a preview), and every write attempt is recorded in `audit_events` with actor `mcp`. It acts as the owner (the first `ALLOWED_USER_IDS` entry).
+The same tools the agent uses, as an [MCP](https://modelcontextprotocol.io) server. Calendar/email: `find_contact`, `list_calendar_events`, `create_calendar_event`, `send_email`. Media: `search_movie`, `search_tv`, `get_title_details`, `discover_movies`, `discover_tv`, `get_trending`, `get_recommendations`, `set_preference`, `remove_preference`, `list_preferences`, `watchlist_add`, `watchlist_remove`, `watchlist_list`, `import_title_list`, `resolve_pending`, `get_recent_list`, `make_google_search_link`; plus the resource `calendar://upcoming` (next 7 days). Calendar, email and media writes do nothing unless `confirm=true` (otherwise they return a preview), and every write attempt is recorded in `audit_events` with actor `mcp`. It acts as the owner (the first `ALLOWED_USER_IDS` entry).
 
 - **HTTP** (started by `docker compose up`, bound to localhost): `http://127.0.0.1:8765/mcp`
   - Claude Code: `claude mcp add --transport http voice-assistant http://127.0.0.1:8765/mcp`
@@ -100,7 +128,7 @@ The same tools the agent uses, as an [MCP](https://modelcontextprotocol.io) serv
   "mcpServers": {
     "voice-assistant": {
       "command": "docker",
-      "args": ["compose", "-f", "C:/Users/you/Desktop/Personal Assistant/docker-compose.yml",
+      "args": ["compose", "-f", "/absolute/path/to/assistant/docker-compose.yml",
                "run", "--rm", "-i", "-T", "--no-deps", "mcp",
                "python", "-m", "app.mcp.server", "--transport", "stdio"]
     }
@@ -144,13 +172,15 @@ docker compose run --rm bot python -m pytest             # offline: scripted mod
 docker compose run --rm -e LIVE_LLM=1 bot python -m pytest tests/test_agent_live.py -s   # real DeepSeek
 ```
 
-The offline suite (about 190 tests) replays ten Persian sample transcripts (`tests/samples.py`: both intents, a missing time, an unknown contact, a hallucinated address, an injection attempt, out of scope) plus provider, tool, confirmation and memory tests. It uses a throwaway `<POSTGRES_DB>_test` database next to the real one.
+The offline suite replays ten Persian sample transcripts (`tests/samples.py`: calendar/email/media intents, a missing time, an unknown contact, a hallucinated address, an injection attempt, out of scope) plus provider, tool, confirmation, memory, media (TMDb/OMDb fakes, recommendations, links, Telegram callbacks, MCP media tools) and real Alembic migration tests. It uses a throwaway `<POSTGRES_DB>_test` database next to the real one; the migration tests create and drop their own scratch databases.
 
 ## Other commands
 
 ```bash
 docker compose run --rm bot python -m app.cli seed
 docker compose run --rm bot python -m app.cli send-test-email
+docker compose run --rm migrate                              # alembic upgrade head
+docker compose run --rm migrate alembic downgrade 0003       # roll back the media migration only
 docker compose exec db sh -c 'psql -U "$POSTGRES_USER" "$POSTGRES_DB"'
 docker compose run --rm bot alembic revision --autogenerate -m "describe change"
 ```
@@ -161,7 +191,8 @@ docker compose run --rm bot alembic revision --autogenerate -m "describe change"
 app/bot      Telegram handlers, previews, pipeline
 app/stt      Vosk + ffmpeg
 app/agent    prompt, schemas, provider, loop, executor, memory
-app/tools    tool registry and implementations, Google Calendar, Resend
+app/tools    tool registry and implementations, Google Calendar, Resend, media wrappers
+app/media    TMDb/OMDb clients, catalog, recommendations, preferences, contexts, links
 app/api      FastAPI app          app/db   models, session, seed, read-only role
 app/mcp      MCP server           app/dashboard   dashboard (queries, demo data, UI)
 app/evals    evaluation set and runner            app/budget.py   token budgets and alerts
@@ -173,11 +204,12 @@ docker-compose.prod.yml  deploy/Caddyfile  scripts/{deploy,backup,restore,check_
 
 ## Status and known limits (v1.0.0)
 
-Done: Telegram bot (allowlist, rate limit, 60 s voice cap), Vosk speech-to-text, DeepSeek agent with validated tools and a confirmation step, Google Calendar and Resend execution with idempotency, memory, admin API, MCP server, usage/quality dashboard with budgets, evaluation set, production compose with HTTPS, backups, deploy and rollback scripts.
+Done: Telegram bot (allowlist, rate limit, 60 s voice cap), Vosk speech-to-text, DeepSeek agent with validated tools and a confirmation step, Google Calendar and Resend execution with idempotency, memory, admin API, MCP server, deterministic film/series recommendations with Persian cards and preference buttons, usage/quality dashboard with budgets, evaluation set, production compose with HTTPS, backups, deploy and rollback scripts.
 
 Limits you should know about:
 
 - **Speech recognition is the weakest link.** The small Vosk Persian model often garbles speech yet reports a high confidence, so the "please repeat" check does not catch it. The agent evaluation measures text understanding only.
+- **Media metadata depends on TMDb.** Persian translations are missing for many titles (the original title is shown instead), OMDb's free tier is rate-limited, and ratings are whatever the provider reports at that moment. The Google link is a search link: it says nothing about availability, subtitles, dubbing or legality.
 - The 100% evaluation score is a development-set score (the prompt was tuned on the same 30 transcripts); expect lower numbers on new phrasing and on real speech.
 - One bot process: rate-limit counters and a pending "Edit" live in memory and are lost on restart.
 - Single server, no high availability; backups are the safety net.

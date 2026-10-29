@@ -238,3 +238,6 @@ register(Tool("create_calendar_event",
     CreateEventArgs, create_calendar_event, side_effect=True))  # fmt: skip
 register(Tool("send_email", "Send an email through Resend.",
     SendEmailArgs, send_email, side_effect=True))  # fmt: skip
+
+# The media extension lives in its own module but uses this same registry (and the same tools table).
+from app.tools import media_impl as _media_impl  # noqa: E402,F401  (registers media tools)
