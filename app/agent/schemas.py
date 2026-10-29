@@ -33,4 +33,26 @@ class Clarification(BaseModel):
     question: str = Field(min_length=1, max_length=500, description="One short question, in Persian")
 
 
-Action = ScheduleAction | EmailAction
+class MediaCard(BaseModel):
+    media_id: int = Field(
+        gt=0, description="Internal id returned by the media tools (not tmdb_id)"
+    )
+    reason: str | None = Field(
+        default=None,
+        max_length=300,
+        description="One short grounded reason, copied from the tool's why/reason; never invent",
+    )
+
+
+class MediaReply(BaseModel):
+    """A short Persian answer plus zero or more media cards (no confirmation needed)."""
+
+    intent: Literal["movie_series"] = "movie_series"
+    text: str = Field(min_length=1, max_length=1200, description="Short Persian answer")
+    items: list[MediaCard] = Field(default_factory=list, max_length=10)
+    pending_id: int | None = Field(
+        default=None, description="pending import id whose candidates the owner must choose"
+    )
+
+
+Action = ScheduleAction | EmailAction | MediaReply

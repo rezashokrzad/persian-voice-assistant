@@ -29,6 +29,8 @@ class ToolContext:
     user: User
     run_id: int | None = None
     now: Callable[[], dt.datetime] = tehran_now
+    # Telegram chat id for «دومی» resolution; 0 outside a chat (MCP).
+    chat_id: int = 0
     # Emails the model may legitimately use: filled by find_contact / context, checked by the agent.
     known_emails: set[str] = field(default_factory=set)
 
